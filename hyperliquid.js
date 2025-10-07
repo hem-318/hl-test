@@ -1,0 +1,224 @@
+const { Hyperliquid } = require("hyperliquid");
+const Redis = require("ioredis");
+
+const hypeSdk = new Hyperliquid({
+  privateKey: process.env.PRIVATE_KEY,
+  testnet: true,
+  enableWs: true,
+});
+
+let redisClient;
+const getRedisClient = () => {
+  if (!redisClient) {
+    try {
+      const redisUrl = process.env.REDIS_URL;
+      redisClient = new Redis(redisUrl, {
+        maxRetriesPerRequest: null,
+      });
+      console.log("Redis client initialized");
+    } catch (error) {
+      console.error("Failed to initialize Redis client:", error);
+      throw error;
+    }
+  }
+  return redisClient;
+};
+
+const getCoinValue = async (coin) => {
+  try {
+    const redisClient = getRedisClient();
+    const spotMidsKey = `mids:${coin}`;
+    const coinValue = await redisClient.get(spotMidsKey);
+    if (!coinValue) throw new Error(`No mids found for ${coin}`);
+    const universe = JSON.parse(coinValue);
+    return Number(universe);
+  } catch (error) {
+    console.error("Error fetching mids:", error);
+    throw new Error(`Failed to ${coin} mids`);
+  }
+};
+
+const getl2bookValue = async (coin) => {
+  try {
+    const redisClient = getRedisClient();
+    const redisKey = `l2book:${coin}`;
+    const coinValue = await redisClient.get(redisKey);
+    if (!coinValue) throw new Error(`No l2bookValue found for ${coin}`);
+    const l2BookValue = JSON.parse(coinValue);
+    return l2BookValue;
+  } catch (error) {
+    console.error(`Error fetching l2bookValue for ${coin}:`, error);
+    throw new Error(`Failed to ${coin} l2bookValue`);
+  }
+};
+
+const getUniverseValue = async (coin) => {
+  try {
+    const redisClient = getRedisClient();
+    const redisKey = `universe:${coin}`;
+    const coinValue = await redisClient.get(redisKey);
+    if (!coinValue) throw new Error(`No universe found for ${coin}`);
+    const universe = JSON.parse(coinValue);
+    return universe;
+  } catch (error) {
+    console.error(`Error fetching universe for ${coin}:`, error);
+    throw new Error(`Failed to ${coin} universe`);
+  }
+};
+
+const getSzValues = (attempt, amount, book, universe, isPerp = true) => {
+  try {
+    const MAX_DECIMALS_PERP = 6;
+    const MAX_DECIMALS_SPOT = 8;
+    const bps = 15 + (attempt - 1) * 10;
+    const bestAsk = parseFloat(book.levels[1][0].px);
+
+    const tickSizeConfig = {
+      ETH: 0.1,
+      SOL: 0.01,
+    };
+
+    const tickSize = tickSizeConfig[universe.name];
+    const szDecimals = universe.szDecimals || 4;
+    const maxDecimals = isPerp ? MAX_DECIMALS_PERP : MAX_DECIMALS_SPOT;
+    const maxAllowedPxDecimals = maxDecimals - szDecimals;
+
+    const rawPx = bestAsk * (1 + bps / 10000);
+    let limit_px = Math.floor(rawPx / tickSize) * tickSize;
+
+    const limit_px_str = limit_px.toFixed(12);
+    const [intPart, decPart = ""] = limit_px_str.split(".");
+    const trimmedDecimals = decPart.slice(0, maxAllowedPxDecimals);
+    limit_px = parseFloat(`${intPart}.${trimmedDecimals}`.replace(/\.$/, ""));
+
+    let limit_px_fixed = parseFloat(limit_px.toPrecision(5));
+    if (limit_px_fixed % tickSize !== 0) {
+      limit_px_fixed = Math.floor(limit_px_fixed / tickSize) * tickSize;
+    }
+
+    limit_px = parseFloat(limit_px_fixed.toFixed(8));
+    const sz = parseFloat(amount.toFixed(szDecimals));
+
+    limit_px = Math.floor(limit_px / tickSize) * tickSize;
+
+    return { limit_px, sz };
+  } catch (error) {
+    console.error("Error fetching limit_px and sz:", error);
+    throw new Error("Failed to compute order price and size");
+  }
+};
+
+const placeIocPerpOrder = async (coin, sz, limit_px) => {
+  const minOrderSize = 0.001;
+  if (sz < minOrderSize) {
+    throw new Error(
+      `Order size ${sz} is below minimum order size ${minOrderSize}`
+    );
+  }
+
+  const coinSymbol = `${coin}-PERP`;
+
+  const orderRequest = {
+    coin: coinSymbol,
+    is_buy: true,
+    sz: sz,
+    limit_px: limit_px,
+    order_type: { limit: { tif: "Ioc" } },
+    reduce_only: false,
+  };
+
+  console.log(`Order request: ${JSON.stringify(orderRequest, null, 2)}`);
+
+  try {
+    const result = await hypeSdk.wsPayloads.placeOrder(orderRequest);
+    console.log(`Order placed successfully!`);
+    return result;
+  } catch (error) {
+    console.error("Order placement failed!");
+    console.log({
+      message: error.message,
+      code: error.code,
+      data: error.data,
+      stack: error.stack,
+    });
+    throw error;
+  }
+};
+
+const calculateHedgeAmount = (totalUsdValue, coinUsd) =>
+  Number((totalUsdValue / coinUsd).toFixed(4));
+
+// --- NEW: Helper to measure duration ---
+const measureExecutionTime = async (fn) => {
+  const start = Date.now();
+  const result = await fn();
+  const end = Date.now();
+  return { result, duration: end - start };
+};
+
+// --- TEST EXECUTION with timing ---
+const testExecution = async () => {
+  console.log("Starting test execution...");
+  await hypeSdk.ws.connect();
+
+  const ordersToExecute = [
+    { coin: "SOL", amount: 15 },
+    { coin: "ETH", amount: 15 },
+  ];
+
+  const executionTimes = [];
+
+  for (const order of ordersToExecute) {
+    const { coin, amount: totalUsdValue } = order;
+    console.log(`\n--- Processing order for ${coin} ---`);
+
+    const startTime = Date.now();
+
+    try {
+      const [coinUsd, l2BookValue, universeValue] = await Promise.all([
+        getCoinValue(coin),
+        getl2bookValue(coin),
+        getUniverseValue(coin),
+      ]);
+
+      const totalAmount = calculateHedgeAmount(totalUsdValue, coinUsd);
+      console.log(`Calculated hedge amount for ${coin}: ${totalAmount}`);
+
+      const { limit_px, sz } = getSzValues(
+        1,
+        totalAmount,
+        l2BookValue,
+        universeValue
+      );
+      console.log(`Calculated sz: ${sz}, limit_px: ${limit_px}`);
+
+      const { duration: orderDuration } = await measureExecutionTime(() =>
+        placeIocPerpOrder(coin, sz, limit_px)
+      );
+
+      const totalDuration = Date.now() - startTime;
+      console.log(
+        `Execution time for ${coin}: ${totalDuration} ms (Order placement: ${orderDuration} ms)`
+      );
+      executionTimes.push(totalDuration);
+    } catch (error) {
+      console.error(`Failed to process order for ${coin}:`, error.message);
+    }
+  }
+
+  const totalLatency = executionTimes.reduce((a, b) => a + b, 0);
+  const avgLatency =
+    executionTimes.length > 0 ? totalLatency / executionTimes.length : 0;
+
+  console.log("\n=== Execution Summary ===");
+  console.log(`Individual order latencies (ms): ${executionTimes.join(", ")}`);
+  console.log(`Average latency: ${avgLatency.toFixed(2)} ms`);
+
+  // Cleanup
+  const redis = getRedisClient();
+  if (redis) redis.disconnect();
+  if (hypeSdk.ws.ws.readyState === 1) hypeSdk.ws.close();
+  console.log("Test execution finished.");
+};
+
+testExecution();
