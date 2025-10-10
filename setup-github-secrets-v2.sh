@@ -52,6 +52,8 @@ echo ""
 echo "If you haven't created a service principal yet, run:"
 echo "az ad sp create-for-rbac --name 'github-latency-test-sp' --role='Contributor' --scopes='/subscriptions/{subscription-id}' --sdk-auth"
 echo ""
+echo "The command above outputs JSON credentials. You'll need those values."
+echo ""
 
 read -p "Enter Azure Client ID: " AZURE_CLIENT_ID
 read -p "Enter Azure Tenant ID: " AZURE_TENANT_ID
@@ -60,7 +62,8 @@ read -s -p "Enter Azure Client Secret: " AZURE_CLIENT_SECRET
 echo ""
 echo ""
 
-# Set Azure secrets
+# Set individual Azure secrets (for compatibility)
+echo "Setting individual Azure secrets..."
 set_secret "AZURE_CLIENT_ID" "$AZURE_CLIENT_ID"
 set_secret "AZURE_TENANT_ID" "$AZURE_TENANT_ID"
 set_secret "AZURE_SUBSCRIPTION_ID" "$AZURE_SUBSCRIPTION_ID"
@@ -98,3 +101,6 @@ echo "gh secret list --repo $REPO"
 echo ""
 echo "To run the workflow, go to:"
 echo "https://github.com/$REPO/actions"
+echo ""
+echo "NOTE: The workflow has been updated to use azure/login@v1 with the creds format."
+echo "This is compatible with the individual secrets we just set up."
