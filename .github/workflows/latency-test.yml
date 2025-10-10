@@ -1,0 +1,371 @@
+name: Azure Multi-Region Latency Test
+
+on:
+  workflow_dispatch: # Manual trigger via GitHub UI
+    inputs:
+      test_regions:
+        description: 'Comma-separated list of regions to test (leave empty for all regions)'
+        required: false
+        default: ''
+  schedule:
+    - cron: '0 2 * * 1' # Run weekly on Monday at 2 AM UTC
+
+env:
+  RESOURCE_GROUP: latency-test-rg
+  VM_SIZE: Standard_F4s_v2
+  VM_IMAGE: Canonical:0001-com-ubuntu-server-jammy:22_04-lts-gen2:latest
+  REDIS_URL: ${{ secrets.REDIS_URL }}
+  PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      regions: ${{ steps.get-regions.outputs.regions }}
+    steps:
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+      
+      - name: Create Resource Group
+        run: |
+          az group create --name ${{ env.RESOURCE_GROUP }} --location centralus || echo "Resource group already exists"
+      
+      - name: Get Azure Regions
+        id: get-regions
+        run: |
+          if [ -n "${{ github.event.inputs.test_regions }}" ]; then
+            # Use manually specified regions
+            REGIONS='${{ github.event.inputs.test_regions }}'
+            REGIONS_JSON=$(echo $REGIONS | jq -R -s -c 'split(",") | map(gsub("\\s+"; ""))')
+          else
+            # Get all available regions that support VMs
+            REGIONS_JSON=$(az account list-locations --query "[?metadata.regionType=='Physical' && metadata.physicalLocation!=null].name" -o json | jq -c 'sort')
+          fi
+          echo "regions=$REGIONS_JSON" >> $GITHUB_OUTPUT
+          echo "Testing regions: $REGIONS_JSON"
+
+  latency-test:
+    needs: [setup]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 10 # Limit concurrent VM deployments
+      matrix:
+        region: ${{ fromJson(needs.setup.outputs.regions) }}
+    timeout-minutes: 30
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+      
+      - name: Test VM Availability in Region
+        id: check-vm
+        continue-on-error: true
+        run: |
+          # Check if VM size is available in the region
+          AVAILABLE=$(az vm list-skus --location ${{ matrix.region }} --size ${{ env.VM_SIZE }} --query "[?resourceType=='virtualMachines' && restrictions[0]==null].name" -o tsv | head -1)
+          if [ -z "$AVAILABLE" ]; then
+            echo "VM size ${{ env.VM_SIZE }} not available in ${{ matrix.region }}"
+            echo "available=false" >> $GITHUB_OUTPUT
+          else
+            echo "available=true" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Run Latency Test in ${{ matrix.region }}
+        if: steps.check-vm.outputs.available == 'true'
+        id: run-test
+        uses: azure/cli@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            set -e
+            
+            # Generate unique VM name
+            VM_NAME="latency-vm-$(echo ${{ matrix.region }} | tr -d '-')$(date +%s)"
+            
+            echo "Creating VM $VM_NAME in ${{ matrix.region }}..."
+            
+            # Create VM with public IP
+            az vm create \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --name "$VM_NAME" \
+              --location ${{ matrix.region }} \
+              --image ${{ env.VM_IMAGE }} \
+              --size ${{ env.VM_SIZE }} \
+              --admin-username azureuser \
+              --generate-ssh-keys \
+              --public-ip-sku Standard \
+              --nic-delete-option delete \
+              --os-disk-delete-option delete \
+              --accelerated-networking true \
+              --tags "purpose=latency-test" "region=${{ matrix.region }}" \
+              --output none
+            
+            echo "VM created successfully. Installing dependencies..."
+            
+            # Install Node.js, npm and clone the test repository
+            INSTALL_SCRIPT='#!/bin/bash
+            set -e
+            
+            # Update system
+            sudo apt-get update -y
+            
+            # Install Node.js 20.x
+            curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+            sudo apt-get install -y nodejs
+            
+            # Clone the test repository
+            cd /home/azureuser
+            if [ -n "${{ secrets.GH_PAT }}" ]; then
+              git clone https://${{ secrets.GH_PAT }}@github.com/hem-318/hl-test.git
+            else
+              git clone https://github.com/hem-318/hl-test.git
+            fi
+            
+            cd hl-test
+            npm install
+            
+            # Create environment variables file
+            cat > .env << EOF
+            REDIS_URL=${{ env.REDIS_URL }}
+            PRIVATE_KEY=${{ env.PRIVATE_KEY }}
+            EOF
+            
+            # Run the latency test (using the correct script name)
+            export REDIS_URL="${{ env.REDIS_URL }}"
+            export PRIVATE_KEY="${{ env.PRIVATE_KEY }}"
+            node hyperliquid.js > /home/azureuser/output.log 2>&1
+            '
+            
+            # Execute installation and test script
+            az vm run-command invoke \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --name "$VM_NAME" \
+              --command-id RunShellScript \
+              --scripts "$INSTALL_SCRIPT" \
+              --timeout 600 \
+              --output none
+            
+            echo "Test execution completed. Retrieving results..."
+            
+            # Retrieve results
+            OUTPUT=$(az vm run-command invoke \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --name "$VM_NAME" \
+              --command-id RunShellScript \
+              --scripts "cat /home/azureuser/output.log || echo 'No output file found'" \
+              --query "value[0].message" \
+              -o tsv)
+            
+            echo "Raw output from ${{ matrix.region }}:"
+            echo "$OUTPUT"
+            
+            # Extract average latency
+            AVG_LATENCY=$(echo "$OUTPUT" | grep -oP 'Average latency: \K[\d.]+' || echo "0")
+            
+            # Save results to file
+            mkdir -p results
+            echo "$OUTPUT" > "results/${{ matrix.region }}.txt"
+            echo "${{ matrix.region }}:$AVG_LATENCY" > "results/${{ matrix.region }}.summary"
+            
+            echo "Average latency for ${{ matrix.region }}: ${AVG_LATENCY} ms"
+            
+            # Delete VM
+            echo "Cleaning up VM..."
+            az vm delete --yes --no-wait \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --name "$VM_NAME" \
+              --output none
+            
+            echo "VM deletion initiated for $VM_NAME"
+      
+      - name: Handle Unavailable Region
+        if: steps.check-vm.outputs.available != 'true'
+        run: |
+          mkdir -p results
+          echo "VM size not available in region" > "results/${{ matrix.region }}.txt"
+          echo "${{ matrix.region }}:999999" > "results/${{ matrix.region }}.summary"
+      
+      - name: Upload Region Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-${{ matrix.region }}
+          path: results/
+          retention-days: 7
+
+  aggregate-results:
+    needs: [latency-test]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      
+      - name: Download All Results
+        uses: actions/download-artifact@v4
+        with:
+          path: all-results
+          pattern: results-*
+      
+      - name: Aggregate and Sort Results
+        run: |
+          # Create aggregation script
+          cat > aggregate.py << 'EOF'
+          import os
+          import re
+          from datetime import datetime
+          
+          results = []
+          
+          # Process all result files
+          for root, dirs, files in os.walk('all-results'):
+              for file in files:
+                  if file.endswith('.summary'):
+                      with open(os.path.join(root, file), 'r') as f:
+                          content = f.read().strip()
+                          if ':' in content:
+                              region, latency = content.split(':')
+                              try:
+                                  latency_val = float(latency)
+                                  if latency_val < 999999:  # Exclude unavailable regions
+                                      results.append((region, latency_val))
+                              except ValueError:
+                                  pass
+          
+          # Sort by latency (ascending)
+          results.sort(key=lambda x: x[1])
+          
+          # Generate markdown report
+          report_lines = [
+              f"# Azure Multi-Region Latency Test Results",
+              f"",
+              f"**Test Date:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}",
+              f"**Total Regions Tested:** {len(results)}",
+              f"",
+              f"## Results Summary (Fastest to Slowest)",
+              f"",
+              f"| Rank | Region | Average Latency (ms) |",
+              f"|------|--------|---------------------|"
+          ]
+          
+          for i, (region, latency) in enumerate(results, 1):
+              report_lines.append(f"| {i} | {region} | {latency:.2f} |")
+          
+          # Add statistics
+          if results:
+              avg_all = sum(r[1] for r in results) / len(results)
+              report_lines.extend([
+                  f"",
+                  f"## Statistics",
+                  f"",
+                  f"- **Fastest Region:** {results[0][0]} ({results[0][1]:.2f} ms)",
+                  f"- **Slowest Region:** {results[-1][0]} ({results[-1][1]:.2f} ms)",
+                  f"- **Average Latency:** {avg_all:.2f} ms",
+                  f"- **Median Latency:** {results[len(results)//2][1]:.2f} ms"
+              ])
+          
+          # Write report
+          with open('LATENCY_TEST_RESULTS.md', 'w') as f:
+              f.write('\n'.join(report_lines))
+          
+          # Also create a CSV for further analysis
+          csv_lines = ["Region,Average_Latency_ms"]
+          for region, latency in results:
+              csv_lines.append(f"{region},{latency:.2f}")
+          
+          with open('latency_results.csv', 'w') as f:
+              f.write('\n'.join(csv_lines))
+          
+          print("Report generated successfully!")
+          print(f"Total regions tested: {len(results)}")
+          if results:
+              print(f"Fastest region: {results[0][0]} ({results[0][1]:.2f} ms)")
+          EOF
+          
+          python3 aggregate.py
+      
+      - name: Display Results Summary
+        run: |
+          if [ -f LATENCY_TEST_RESULTS.md ]; then
+            cat LATENCY_TEST_RESULTS.md
+          else
+            echo "No results file generated"
+          fi
+      
+      - name: Upload Final Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: latency-test-report
+          path: |
+            LATENCY_TEST_RESULTS.md
+            latency_results.csv
+          retention-days: 30
+      
+      - name: Commit Results to Repository
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          
+          # Create results directory if it doesn't exist
+          mkdir -p test-results
+          
+          # Move results with timestamp
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          mv LATENCY_TEST_RESULTS.md "test-results/LATENCY_RESULTS_${TIMESTAMP}.md"
+          cp "test-results/LATENCY_RESULTS_${TIMESTAMP}.md" "test-results/LATEST_RESULTS.md"
+          
+          # Commit and push
+          git add test-results/
+          git commit -m "Update latency test results - ${TIMESTAMP}" || echo "No changes to commit"
+          git push || echo "No changes to push"
+
+  cleanup:
+    needs: [aggregate-results]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+      
+      - name: Clean Up Orphaned Resources
+        run: |
+          # Delete any remaining VMs in the resource group
+          echo "Cleaning up any remaining test VMs..."
+          
+          VM_LIST=$(az vm list --resource-group ${{ env.RESOURCE_GROUP }} --query "[?tags.purpose=='latency-test'].name" -o tsv || echo "")
+          
+          if [ -n "$VM_LIST" ]; then
+            echo "Found orphaned VMs: $VM_LIST"
+            for VM in $VM_LIST; do
+              echo "Deleting VM: $VM"
+              az vm delete --yes --no-wait --resource-group ${{ env.RESOURCE_GROUP }} --name "$VM" || echo "Failed to delete $VM"
+            done
+          else
+            echo "No orphaned VMs found"
+          fi
+          
+          # Optional: Delete the entire resource group after tests
+          # Uncomment the following line if you want to delete the RG after each run
+          # az group delete --name ${{ env.RESOURCE_GROUP }} --yes --no-wait || echo "Failed to delete resource group"
