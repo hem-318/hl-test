@@ -7,6 +7,11 @@ on:
         description: 'Comma-separated list of regions to test (leave empty for all regions)'
         required: false
         default: ''
+      sequential_mode:
+        description: 'Run tests sequentially (one region at a time)'
+        required: false
+        default: true
+        type: boolean
   schedule:
     - cron: '0 2 * * 1' # Run weekly on Monday at 2 AM UTC
 
@@ -22,6 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       regions: ${{ steps.get-regions.outputs.regions }}
+      sequential: ${{ steps.get-regions.outputs.sequential }}
     steps:
       - name: Azure Login
         uses: azure/login@v1
@@ -49,15 +55,24 @@ jobs:
             # Get all available regions that support VMs
             REGIONS_JSON=$(az account list-locations --query "[?metadata.regionType=='Physical' && metadata.physicalLocation!=null].name" -o json | jq -c 'sort')
           fi
+          
+          # Determine if sequential mode is enabled
+          SEQUENTIAL="${{ github.event.inputs.sequential_mode }}"
+          if [ -z "$SEQUENTIAL" ]; then
+            SEQUENTIAL="true"  # Default to sequential
+          fi
+          
           echo "regions=$REGIONS_JSON" >> $GITHUB_OUTPUT
+          echo "sequential=$SEQUENTIAL" >> $GITHUB_OUTPUT
           echo "Testing regions: $REGIONS_JSON"
+          echo "Sequential mode: $SEQUENTIAL"
 
   latency-test:
     needs: [setup]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      max-parallel: 10 # Limit concurrent VM deployments
+      max-parallel: ${{ needs.setup.outputs.sequential == 'true' && 1 || 10 }}
       matrix:
         region: ${{ fromJson(needs.setup.outputs.regions) }}
     timeout-minutes: 30
@@ -136,9 +151,9 @@ jobs:
             # Clone the test repository
             cd /home/azureuser
             if [ -n "${{ secrets.GH_PAT }}" ]; then
-              git clone https://${{ secrets.GH_PAT }}@github.com/hem-318/hl-test.git
+              git clone https://${{ secrets.GH_PAT }}@github.com/${{ github.repository }}.git
             else
-              git clone https://github.com/hem-318/hl-test.git
+              git clone https://github.com/${{ github.repository }}.git
             fi
             
             cd hl-test
@@ -148,11 +163,13 @@ jobs:
             cat > .env << EOF
             REDIS_URL=${{ env.REDIS_URL }}
             PRIVATE_KEY=${{ env.PRIVATE_KEY }}
+            REGION=${{ matrix.region }}
             EOF
             
-            # Run the latency test (using the correct script name)
+            # Run the latency test with region information
             export REDIS_URL="${{ env.REDIS_URL }}"
             export PRIVATE_KEY="${{ env.PRIVATE_KEY }}"
+            export REGION="${{ matrix.region }}"
             node hyperliquid.js > /home/azureuser/output.log 2>&1
             '
             
@@ -222,159 +239,102 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
       
-      - name: Download All Results
+      - name: Download All Artifacts
         uses: actions/download-artifact@v4
         with:
-          path: all-results
-          pattern: results-*
+          path: artifacts/
       
-      - name: Aggregate and Sort Results
+      - name: Aggregate Results
         run: |
-          # Create aggregation script
-          cat > aggregate.py << 'EOF'
-          import os
-          import re
-          from datetime import datetime
+          mkdir -p aggregated-results
           
-          results = []
+          # Combine all region results
+          for artifact_dir in artifacts/results-*/; do
+            if [ -d "$artifact_dir" ]; then
+              cp -r "$artifact_dir"/* aggregated-results/ 2>/dev/null || true
+            fi
+          done
           
-          # Process all result files
-          for root, dirs, files in os.walk('all-results'):
-              for file in files:
-                  if file.endswith('.summary'):
-                      with open(os.path.join(root, file), 'r') as f:
-                          content = f.read().strip()
-                          if ':' in content:
-                              region, latency = content.split(':')
-                              try:
-                                  latency_val = float(latency)
-                                  if latency_val < 999999:  # Exclude unavailable regions
-                                      results.append((region, latency_val))
-                              except ValueError:
-                                  pass
+          # Create comprehensive results file
+          TIMESTAMP=$(date -u +"%Y%m%d_%H%M%S")
+          RESULTS_FILE="aggregated-results/LATENCY_RESULTS_${TIMESTAMP}.md"
           
-          # Sort by latency (ascending)
-          results.sort(key=lambda x: x[1])
+          echo "# Azure Multi-Region Latency Test Results" > "$RESULTS_FILE"
+          echo "" >> "$RESULTS_FILE"
+          echo "**Test Date:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> "$RESULTS_FILE"
+          echo "**Sequential Mode:** ${{ needs.setup.outputs.sequential }}" >> "$RESULTS_FILE"
+          echo "" >> "$RESULTS_FILE"
           
-          # Generate markdown report
-          report_lines = [
-              f"# Azure Multi-Region Latency Test Results",
-              f"",
-              f"**Test Date:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}",
-              f"**Total Regions Tested:** {len(results)}",
-              f"",
-              f"## Results Summary (Fastest to Slowest)",
-              f"",
-              f"| Rank | Region | Average Latency (ms) |",
-              f"|------|--------|---------------------|"
-          ]
+          # Count successful regions
+          SUCCESSFUL_REGIONS=$(find aggregated-results -name "*.summary" -exec grep -v ":999999$" {} \; | wc -l)
+          echo "**Total Regions Tested:** $SUCCESSFUL_REGIONS" >> "$RESULTS_FILE"
+          echo "" >> "$RESULTS_FILE"
           
-          for i, (region, latency) in enumerate(results, 1):
-              report_lines.append(f"| {i} | {region} | {latency:.2f} |")
+          # Sort regions by latency
+          echo "## Results Summary (Fastest to Slowest)" >> "$RESULTS_FILE"
+          echo "" >> "$RESULTS_FILE"
+          echo "| Rank | Region | Average Latency (ms) |" >> "$RESULTS_FILE"
+          echo "|------|--------|---------------------|" >> "$RESULTS_FILE"
           
-          # Add statistics
-          if results:
-              avg_all = sum(r[1] for r in results) / len(results)
-              report_lines.extend([
-                  f"",
-                  f"## Statistics",
-                  f"",
-                  f"- **Fastest Region:** {results[0][0]} ({results[0][1]:.2f} ms)",
-                  f"- **Slowest Region:** {results[-1][0]} ({results[-1][1]:.2f} ms)",
-                  f"- **Average Latency:** {avg_all:.2f} ms",
-                  f"- **Median Latency:** {results[len(results)//2][1]:.2f} ms"
-              ])
+          # Process and sort results
+          find aggregated-results -name "*.summary" -exec cat {} \; | \
+            grep -v ":999999$" | \
+            sort -t: -k2 -n | \
+            nl -nln | \
+            while IFS=: read -r rank region latency; do
+              echo "| $rank | $region | $latency |" >> "$RESULTS_FILE"
+            done
           
-          # Write report
-          with open('LATENCY_TEST_RESULTS.md', 'w') as f:
-              f.write('\n'.join(report_lines))
+          echo "" >> "$RESULTS_FILE"
+          echo "## Detailed Results by Region" >> "$RESULTS_FILE"
+          echo "" >> "$RESULTS_FILE"
           
-          # Also create a CSV for further analysis
-          csv_lines = ["Region,Average_Latency_ms"]
-          for region, latency in results:
-              csv_lines.append(f"{region},{latency:.2f}")
+          # Add detailed results for each region
+          for summary_file in aggregated-results/*.summary; do
+            if [ -f "$summary_file" ]; then
+              region=$(basename "$summary_file" .summary)
+              latency=$(cat "$summary_file" | cut -d: -f2)
+              
+              echo "### $region" >> "$RESULTS_FILE"
+              echo "" >> "$RESULTS_FILE"
+              echo "**Average Latency:** ${latency} ms" >> "$RESULTS_FILE"
+              echo "" >> "$RESULTS_FILE"
+              
+              # Add detailed output if available
+              detail_file="aggregated-results/${region}.txt"
+              if [ -f "$detail_file" ]; then
+                echo '```' >> "$RESULTS_FILE"
+                cat "$detail_file" >> "$RESULTS_FILE"
+                echo '```' >> "$RESULTS_FILE"
+                echo "" >> "$RESULTS_FILE"
+              fi
+            fi
+          done
           
-          with open('latency_results.csv', 'w') as f:
-              f.write('\n'.join(csv_lines))
+          # Update latest results
+          cp "$RESULTS_FILE" aggregated-results/LATEST_RESULTS.md
           
-          print("Report generated successfully!")
-          print(f"Total regions tested: {len(results)}")
-          if results:
-              print(f"Fastest region: {results[0][0]} ({results[0][1]:.2f} ms)")
-          EOF
-          
-          python3 aggregate.py
+          echo "Results aggregated successfully!"
+          echo "Generated: $RESULTS_FILE"
       
-      - name: Display Results Summary
-        run: |
-          if [ -f LATENCY_TEST_RESULTS.md ]; then
-            cat LATENCY_TEST_RESULTS.md
-          else
-            echo "No results file generated"
-          fi
-      
-      - name: Upload Final Report
+      - name: Upload Aggregated Results
         uses: actions/upload-artifact@v4
         with:
-          name: latency-test-report
-          path: |
-            LATENCY_TEST_RESULTS.md
-            latency_results.csv
+          name: aggregated-results
+          path: aggregated-results/
           retention-days: 30
       
       - name: Commit Results to Repository
-        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         run: |
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
+          # Configure git
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
           
-          # Create results directory if it doesn't exist
+          # Copy results to test-results directory
           mkdir -p test-results
-          
-          # Move results with timestamp
-          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-          mv LATENCY_TEST_RESULTS.md "test-results/LATENCY_RESULTS_${TIMESTAMP}.md"
-          cp "test-results/LATENCY_RESULTS_${TIMESTAMP}.md" "test-results/LATEST_RESULTS.md"
+          cp aggregated-results/* test-results/
           
           # Commit and push
           git add test-results/
-          git commit -m "Update latency test results - ${TIMESTAMP}" || echo "No changes to commit"
-          git push || echo "No changes to push"
-
-  cleanup:
-    needs: [aggregate-results]
-    runs-on: ubuntu-latest
-    if: always()
-    
-    steps:
-      - name: Azure Login
-        uses: azure/login@v1
-        with:
-          creds: |
-            {
-              "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
-              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
-              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}",
-              "tenantId": "${{ secrets.AZURE_TENANT_ID }}"
-            }
-      
-      - name: Clean Up Orphaned Resources
-        run: |
-          # Delete any remaining VMs in the resource group
-          echo "Cleaning up any remaining test VMs..."
-          
-          VM_LIST=$(az vm list --resource-group ${{ env.RESOURCE_GROUP }} --query "[?tags.purpose=='latency-test'].name" -o tsv || echo "")
-          
-          if [ -n "$VM_LIST" ]; then
-            echo "Found orphaned VMs: $VM_LIST"
-            for VM in $VM_LIST; do
-              echo "Deleting VM: $VM"
-              az vm delete --yes --no-wait --resource-group ${{ env.RESOURCE_GROUP }} --name "$VM" || echo "Failed to delete $VM"
-            done
-          else
-            echo "No orphaned VMs found"
-          fi
-          
-          # Optional: Delete the entire resource group after tests
-          # Uncomment the following line if you want to delete the RG after each run
-          # az group delete --name ${{ env.RESOURCE_GROUP }} --yes --no-wait || echo "Failed to delete resource group"
+          git diff --staged --quiet || git commit -m "Update latency test results - $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+          git push || echo "No changes to commit"
