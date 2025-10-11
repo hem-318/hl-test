@@ -1,1 +1,1 @@
-VM size not available in region
+No suitable VM size available in region
