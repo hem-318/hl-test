@@ -3,7 +3,7 @@ const Redis = require("ioredis");
 
 const hypeSdk = new Hyperliquid({
   privateKey: process.env.PRIVATE_KEY,
-  testnet: true,
+  testnet: false, // Changed to mainnet for real orders
   enableWs: true,
 });
 
@@ -158,50 +158,98 @@ const measureExecutionTime = async (fn) => {
 
 // --- TEST EXECUTION with timing ---
 const testExecution = async () => {
-  console.log("Starting test execution...");
+  const region = process.env.REGION || 'unknown';
+  const timestamp = new Date().toISOString();
+  
+  console.log("=".repeat(60));
+  console.log(`Starting latency test execution`);
+  console.log(`Region: ${region}`);
+  console.log(`Timestamp: ${timestamp}`);
+  console.log("=".repeat(60));
+  
   await hypeSdk.ws.connect();
 
   const ordersToExecute = [
-    { coin: "SOL", amount: 15 },
-    { coin: "ETH", amount: 15 },
+    { coin: "SOL", amount: 15 }, // $15 order value (above $11 minimum)
+    { coin: "ETH", amount: 15 }, // $15 order value (above $11 minimum)
   ];
 
   const executionTimes = [];
+  const detailedResults = [];
 
   for (const order of ordersToExecute) {
     const { coin, amount: totalUsdValue } = order;
     console.log(`\n--- Processing order for ${coin} ---`);
 
     const startTime = Date.now();
+    const stepTimes = {};
 
     try {
+      // Step 1: Data fetching
+      const dataStart = Date.now();
       const [coinUsd, l2BookValue, universeValue] = await Promise.all([
         getCoinValue(coin),
         getl2bookValue(coin),
         getUniverseValue(coin),
       ]);
+      stepTimes.dataFetch = Date.now() - dataStart;
 
+      // Step 2: Amount calculation
+      const calcStart = Date.now();
       const totalAmount = calculateHedgeAmount(totalUsdValue, coinUsd);
+      stepTimes.calculation = Date.now() - calcStart;
       console.log(`Calculated hedge amount for ${coin}: ${totalAmount}`);
 
+      // Step 3: Order parameters calculation
+      const paramsStart = Date.now();
       const { limit_px, sz } = getSzValues(
         1,
         totalAmount,
         l2BookValue,
         universeValue
       );
+      stepTimes.paramsCalculation = Date.now() - paramsStart;
       console.log(`Calculated sz: ${sz}, limit_px: ${limit_px}`);
 
+      // Step 4: Order placement
       const { duration: orderDuration } = await measureExecutionTime(() =>
         placeIocPerpOrder(coin, sz, limit_px)
       );
+      stepTimes.orderPlacement = orderDuration;
 
       const totalDuration = Date.now() - startTime;
-      console.log(
-        `Execution time for ${coin}: ${totalDuration} ms (Order placement: ${orderDuration} ms)`
-      );
+      
+      const orderResult = {
+        coin,
+        totalDuration,
+        stepTimes,
+        success: true,
+        error: null
+      };
+      
+      detailedResults.push(orderResult);
       executionTimes.push(totalDuration);
+      
+      console.log(`\n--- ${coin} Execution Breakdown ---`);
+      console.log(`Data fetch: ${stepTimes.dataFetch} ms`);
+      console.log(`Calculation: ${stepTimes.calculation} ms`);
+      console.log(`Params calculation: ${stepTimes.paramsCalculation} ms`);
+      console.log(`Order placement: ${stepTimes.orderPlacement} ms`);
+      console.log(`Total execution: ${totalDuration} ms`);
+      
     } catch (error) {
+      const totalDuration = Date.now() - startTime;
+      const orderResult = {
+        coin,
+        totalDuration,
+        stepTimes: {},
+        success: false,
+        error: error.message
+      };
+      
+      detailedResults.push(orderResult);
+      executionTimes.push(totalDuration);
+      
       console.error(`Failed to process order for ${coin}:`, error.message);
     }
   }
@@ -210,9 +258,36 @@ const testExecution = async () => {
   const avgLatency =
     executionTimes.length > 0 ? totalLatency / executionTimes.length : 0;
 
-  console.log("\n=== Execution Summary ===");
+  console.log("\n" + "=".repeat(60));
+  console.log("=== EXECUTION SUMMARY ===");
+  console.log(`Region: ${region}`);
+  console.log(`Test completed at: ${new Date().toISOString()}`);
+  console.log(`Total orders processed: ${ordersToExecute.length}`);
+  console.log(`Successful orders: ${detailedResults.filter(r => r.success).length}`);
+  console.log(`Failed orders: ${detailedResults.filter(r => !r.success).length}`);
   console.log(`Individual order latencies (ms): ${executionTimes.join(", ")}`);
   console.log(`Average latency: ${avgLatency.toFixed(2)} ms`);
+  
+  // Calculate step-wise averages
+  const avgStepTimes = {};
+  const successfulResults = detailedResults.filter(r => r.success);
+  
+  if (successfulResults.length > 0) {
+    ['dataFetch', 'calculation', 'paramsCalculation', 'orderPlacement'].forEach(step => {
+      const stepValues = successfulResults.map(r => r.stepTimes[step]).filter(v => v !== undefined);
+      if (stepValues.length > 0) {
+        avgStepTimes[step] = (stepValues.reduce((a, b) => a + b, 0) / stepValues.length).toFixed(2);
+      }
+    });
+    
+    console.log("\n--- Average Step Times ---");
+    console.log(`Data fetch: ${avgStepTimes.dataFetch || 'N/A'} ms`);
+    console.log(`Calculation: ${avgStepTimes.calculation || 'N/A'} ms`);
+    console.log(`Params calculation: ${avgStepTimes.paramsCalculation || 'N/A'} ms`);
+    console.log(`Order placement: ${avgStepTimes.orderPlacement || 'N/A'} ms`);
+  }
+  
+  console.log("=".repeat(60));
 
   // Cleanup
   const redis = getRedisClient();
