@@ -17,7 +17,6 @@ on:
 
 env:
   RESOURCE_GROUP: latency-test-rg
-  VM_SIZE: Standard_F4s_v2
   VM_IMAGE: Canonical:0001-com-ubuntu-server-jammy:22_04-lts-gen2:latest
   REDIS_URL: ${{ secrets.REDIS_URL }}
   PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
@@ -92,21 +91,223 @@ jobs:
               "tenantId": "${{ secrets.AZURE_TENANT_ID }}"
             }
       
-      - name: Test VM Availability in Region
-        id: check-vm
-        continue-on-error: true
+      - name: Pick best VM size for ${{ matrix.region }}
+        id: pick-size
+        shell: bash
+        env:
+          REGION: ${{ matrix.region }}
         run: |
-          # Check if VM size is available in the region
-          AVAILABLE=$(az vm list-skus --location ${{ matrix.region }} --size ${{ env.VM_SIZE }} --query "[?resourceType=='virtualMachines' && restrictions[0]==null].name" -o tsv | head -1)
-          if [ -z "$AVAILABLE" ]; then
-            echo "VM size ${{ env.VM_SIZE }} not available in ${{ matrix.region }}"
-            echo "available=false" >> $GITHUB_OUTPUT
-          else
-            echo "available=true" >> $GITHUB_OUTPUT
+          set -euo pipefail
+
+          # Discover available SKUs for VMs in this region
+          SKUS_JSON=$(az vm list-skus --location "$REGION" --resource-type virtualMachines --all -o json)
+
+          # Helper to extract capability by name
+          jqcap='
+            def cap($n):
+              (.capabilities // []) | map(select(.name == $n)) | .[0].value // empty
+          '
+
+          # Build a table of candidate SKUs with capabilities we care about
+          echo "$SKUS_JSON" | jq -r --argjson pref '[
+            "Standard_F4s_v2","Standard_D4ds_v5","Standard_D4s_v5",
+            "Standard_D4s_v3","Standard_F4s","Standard_D4as_v5"
+          ]' '
+            '"$jqcap"' 
+            [
+              .[] 
+              | select(.resourceType=="virtualMachines" and (.restrictions|length==0)) 
+              | {
+                  name: .name,
+                  vcpus: (cap("vCPUs")|tonumber? // 0),
+                  mem: (cap("MemoryGB")|tonumber? // 0),
+                  premium: ((cap("PremiumIO")|ascii_downcase)=="true"),
+                  an: ((cap("AcceleratedNetworkingEnabled")|ascii_downcase)=="true")
+                }
+              | select(.vcpus >= 4 and .mem >= 8)
+            ]
+            as $all
+            |
+            # Preferred list first (if present), preserving the given order
+            ( $pref
+              | map(.)
+              | map( {name:., rank: (index(.) // 9999)} )
+              | map(
+                  . as $p
+                  | ($all | map(select(.name==$p.name)))[0] // empty
+                )
+              | map(select(.name != null))
+            ) as $preferred
+            |
+            # Non-preferred matches, sorted by AN desc, Premium desc, vcpus asc, mem asc, name asc
+            ( $all
+              | map(select([.name] | inside($preferred | map(.name)) | not))
+              | sort_by( (if .an then 0 else 1 end),
+                         (if .premium then 0 else 1 end),
+                         .vcpus, .mem, .name )
+            ) as $others
+            |
+            ($preferred + $others)
+          ' > _candidates.json
+
+          if [[ ! -s _candidates.json ]]; then
+            echo "No matching VM sizes found in $REGION" >&2
+            echo "best_size=" >> "$GITHUB_OUTPUT"
+            echo "an_supported=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+
+          BEST_SIZE=$(jq -r '.[0].name' _candidates.json)
+          AN=$(jq -r '.[0].an' _candidates.json)
+
+          echo "best_size=$BEST_SIZE" >> "$GITHUB_OUTPUT"
+          echo "an_supported=$AN" >> "$GITHUB_OUTPUT"
+
+          # Also export a short candidate list (top 6) for fallback attempts
+          jq -r '.[0:6] | map(.name) | @tsv' _candidates.json > _candidates.tsv
       
-      - name: Run Latency Test in ${{ matrix.region }}
-        if: steps.check-vm.outputs.available == 'true'
+      - name: Create networking resources
+        if: steps.pick-size.outputs.best_size != ''
+        id: net
+        shell: bash
+        env:
+          RG: ${{ env.RESOURCE_GROUP }}
+          REGION: ${{ matrix.region }}
+        run: |
+          set -euo pipefail
+          
+          # Create VNet
+          VNET="vnet-${REGION}"
+          az network vnet create -g "$RG" -n "$VNET" -l "$REGION" \
+            --address-prefix 10.0.0.0/16 >/dev/null
+          echo "vnet=$VNET" >> "$GITHUB_OUTPUT"
+          
+          # Create Subnet
+          SUBNET="subnet-${REGION}"
+          az network vnet subnet create -g "$RG" --vnet-name "$VNET" \
+            -n "$SUBNET" --address-prefix 10.0.0.0/24 >/dev/null
+          echo "subnet=$SUBNET" >> "$GITHUB_OUTPUT"
+          
+          # Create NSG
+          NSG="nsg-${REGION}"
+          az network nsg create -g "$RG" -n "$NSG" -l "$REGION" >/dev/null
+          
+          # Add SSH rule
+          az network nsg rule create -g "$RG" --nsg-name "$NSG" \
+            -n allow-ssh --priority 100 --direction Inbound \
+            --source-address-prefixes '*' --source-port-ranges '*' \
+            --destination-address-prefixes '*' --destination-port-ranges 22 \
+            --access Allow --protocol Tcp >/dev/null
+          echo "nsg=$NSG" >> "$GITHUB_OUTPUT"
+          
+          # Create Public IP
+          PIP="pip-${REGION}"
+          az network public-ip create -g "$RG" -n "$PIP" -l "$REGION" \
+            --sku Standard --allocation-method Static >/dev/null
+          echo "pip=$PIP" >> "$GITHUB_OUTPUT"
+      
+      - name: Create NIC (Accelerated Networking if supported)
+        if: steps.pick-size.outputs.best_size != ''
+        id: nic
+        shell: bash
+        env:
+          RG: ${{ env.RESOURCE_GROUP }}
+          REGION: ${{ matrix.region }}
+          VNET: ${{ steps.net.outputs.vnet }}
+          SUBNET: ${{ steps.net.outputs.subnet }}
+          PIP: ${{ steps.net.outputs.pip }}
+          NSG: ${{ steps.net.outputs.nsg }}
+          AN: ${{ steps.pick-size.outputs.an_supported }}
+        run: |
+          set -euo pipefail
+          NIC="nic-${REGION}"
+          if [[ "${AN}" == "true" ]]; then
+            az network nic create -g "$RG" -n "$NIC" -l "$REGION" \
+              --vnet-name "$VNET" --subnet "$SUBNET" \
+              --network-security-group "$NSG" \
+              --public-ip-address "$PIP" \
+              --accelerated-networking true >/dev/null
+          else
+            az network nic create -g "$RG" -n "$NIC" -l "$REGION" \
+              --vnet-name "$VNET" --subnet "$SUBNET" \
+              --network-security-group "$NSG" \
+              --public-ip-address "$PIP" >/dev/null
+          fi
+          echo "nic=$NIC" >> "$GITHUB_OUTPUT"
+      
+      - name: Create VM (with size fallback)
+        if: steps.pick-size.outputs.best_size != ''
+        id: vm
+        shell: bash
+        env:
+          RG: ${{ env.RESOURCE_GROUP }}
+          REGION: ${{ matrix.region }}
+          NIC: ${{ steps.nic.outputs.nic }}
+          DEFAULT_SIZE: ${{ steps.pick-size.outputs.best_size }}
+          VM_IMAGE: ${{ env.VM_IMAGE }}
+        run: |
+          set -euo pipefail
+          VM="latency-vm-${REGION}"
+
+          if [[ -z "${DEFAULT_SIZE}" ]]; then
+            echo "No suitable size discovered for ${REGION} — skipping."
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Build candidate list: discovered top (DEFAULT_SIZE) + remaining from _candidates.tsv
+          candidates=()
+          candidates+=("$DEFAULT_SIZE")
+          if [[ -f _candidates.tsv ]]; then
+            while IFS=$'\t' read -r name; do
+              [[ "$name" != "$DEFAULT_SIZE" ]] && candidates+=("$name")
+            done < _candidates.tsv
+          fi
+
+          echo "Trying sizes in ${REGION}: ${candidates[*]}"
+
+          attempt=0
+          created=false
+          for size in "${candidates[@]}"; do
+            attempt=$((attempt+1))
+            echo "Attempt ${attempt}: size=${size}"
+            set +e
+            az vm create -g "$RG" -n "$VM" -l "$REGION" \
+              --nics "$NIC" --image "$VM_IMAGE" \
+              --size "$size" \
+              --admin-username azureuser \
+              --generate-ssh-keys >/tmp/vm_create.log 2>&1
+            rc=$?
+            set -e
+            if [[ $rc -eq 0 ]]; then
+              echo "VM created with size ${size}"
+              created=true
+              echo "size=${size}" >> "$GITHUB_OUTPUT"
+              break
+            fi
+
+            # Inspect error for known transient/unsupported cases, then continue
+            if grep -Eqi "SkuNotAvailable|AllocationFailed|OperationNotAllowed|Conflict|Insufficient|Overconstrained|Quota" /tmp/vm_create.log; then
+              echo "Size ${size} failed due to availability/capacity/quota; trying next..."
+              continue
+            else
+              echo "Unexpected failure creating VM with ${size}:"
+              sed -n '1,200p' /tmp/vm_create.log
+              # Attempt next anyway
+            fi
+          done
+
+          if [[ "${created}" != "true" ]]; then
+            echo "Could not create VM with any candidate size in ${REGION} — skipping."
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "skipped=false" >> "$GITHUB_OUTPUT"
+          echo "vm=$VM" >> "$GITHUB_OUTPUT"
+      
+      - name: Run Latency Test
+        if: steps.vm.outputs.skipped != 'true' && steps.pick-size.outputs.best_size != ''
         id: run-test
         uses: azure/cli@v2
         with:
@@ -114,26 +315,9 @@ jobs:
           inlineScript: |
             set -e
             
-            # Generate unique VM name
-            VM_NAME="latency-vm-$(echo ${{ matrix.region }} | tr -d '-')$(date +%s)"
+            VM_NAME="${{ steps.vm.outputs.vm }}"
             
-            echo "Creating VM $VM_NAME in ${{ matrix.region }}..."
-            
-            # Create VM with public IP
-            az vm create \
-              --resource-group ${{ env.RESOURCE_GROUP }} \
-              --name "$VM_NAME" \
-              --location ${{ matrix.region }} \
-              --image ${{ env.VM_IMAGE }} \
-              --size ${{ env.VM_SIZE }} \
-              --admin-username azureuser \
-              --generate-ssh-keys \
-              --public-ip-sku Standard \
-              --nic-delete-option delete \
-              --os-disk-delete-option delete \
-              --accelerated-networking true \
-              --tags "purpose=latency-test" "region=${{ matrix.region }}" \
-              --output none
+            echo "Installing dependencies on VM $VM_NAME in ${{ matrix.region }}..."
             
             echo "VM created successfully. Installing dependencies..."
             
@@ -206,20 +390,50 @@ jobs:
             
             echo "Average latency for ${{ matrix.region }}: ${AVG_LATENCY} ms"
             
+            # Store VM size used for reporting
+            echo "VM size used: ${{ steps.vm.outputs.size }}" >> "results/${{ matrix.region }}.txt"
+            
+            # Clean up all resources
+            echo "Cleaning up resources..."
+            
             # Delete VM
-            echo "Cleaning up VM..."
             az vm delete --yes --no-wait \
               --resource-group ${{ env.RESOURCE_GROUP }} \
               --name "$VM_NAME" \
               --output none
             
-            echo "VM deletion initiated for $VM_NAME"
+            # Delete NIC
+            az network nic delete --no-wait \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --name "${{ steps.nic.outputs.nic }}" || true
+            
+            # Delete Public IP
+            az network public-ip delete --no-wait \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --name "${{ steps.net.outputs.pip }}" || true
+            
+            # Delete NSG
+            az network nsg delete --no-wait \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --name "${{ steps.net.outputs.nsg }}" || true
+            
+            # Delete Subnet and VNet
+            az network vnet subnet delete \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --vnet-name "${{ steps.net.outputs.vnet }}" \
+              --name "${{ steps.net.outputs.subnet }}" || true
+            
+            az network vnet delete --no-wait \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --name "${{ steps.net.outputs.vnet }}" || true
+            
+            echo "Resource cleanup initiated for ${{ matrix.region }}"
       
       - name: Handle Unavailable Region
-        if: steps.check-vm.outputs.available != 'true'
+        if: steps.pick-size.outputs.best_size == '' || steps.vm.outputs.skipped == 'true'
         run: |
           mkdir -p results
-          echo "VM size not available in region" > "results/${{ matrix.region }}.txt"
+          echo "No suitable VM size available in region" > "results/${{ matrix.region }}.txt"
           echo "${{ matrix.region }}:999999" > "results/${{ matrix.region }}.summary"
       
       - name: Upload Region Results
