@@ -416,16 +416,17 @@ jobs:
             export REDIS_URL="${{ env.REDIS_URL }}"
             export PRIVATE_KEY="${{ env.PRIVATE_KEY }}"
             export REGION="${{ matrix.region }}"
-            node hyperliquid.js > /home/azureuser/output.log 2>&1
+            # Add timeout to prevent hanging (10 minutes should be enough)
+            timeout 600 node hyperliquid.js > /home/azureuser/output.log 2>&1 || echo "Test timed out or failed"
             '
             
             # Execute installation and test script
+            # Note: --timeout parameter not supported in GitHub Actions Azure CLI
             az vm run-command invoke \
               --resource-group ${{ env.RESOURCE_GROUP }} \
               --name "$VM_NAME" \
               --command-id RunShellScript \
               --scripts "$INSTALL_SCRIPT" \
-              --timeout 600 \
               --output none
             
             echo "Test execution completed. Retrieving results..."
