@@ -102,53 +102,39 @@ jobs:
           # Discover available SKUs for VMs in this region
           SKUS_JSON=$(az vm list-skus --location "$REGION" --resource-type virtualMachines --all -o json)
 
-          # Helper to extract capability by name
-          jqcap='
-            def cap($n):
-              (.capabilities // []) | map(select(.name == $n)) | .[0].value // empty
-          '
-
+          # Save to temp file to avoid pipe issues
+          echo "$SKUS_JSON" > _skus.json
+          
           # Build a table of candidate SKUs with capabilities we care about
-          echo "$SKUS_JSON" | jq -r --argjson pref '[
+          jq -r --argjson pref '[
             "Standard_F4s_v2","Standard_D4ds_v5","Standard_D4s_v5",
             "Standard_D4s_v3","Standard_F4s","Standard_D4as_v5"
           ]' '
-            '"$jqcap"' 
-            [
-              .[] 
-              | select(.resourceType=="virtualMachines" and (.restrictions|length==0)) 
-              | {
-                  name: .name,
-                  vcpus: (cap("vCPUs")|tonumber? // 0),
-                  mem: (cap("MemoryGB")|tonumber? // 0),
-                  premium: ((cap("PremiumIO")|ascii_downcase)=="true"),
-                  an: ((cap("AcceleratedNetworkingEnabled")|ascii_downcase)=="true")
-                }
-              | select(.vcpus >= 4 and .mem >= 8)
-            ]
-            as $all
-            |
-            # Preferred list first (if present), preserving the given order
-            ( $pref
-              | map(.)
-              | map( {name:., rank: (index(.) // 9999)} )
-              | map(
-                  . as $p
-                  | ($all | map(select(.name==$p.name)))[0] // empty
-                )
-              | map(select(.name != null))
-            ) as $preferred
-            |
-            # Non-preferred matches, sorted by AN desc, Premium desc, vcpus asc, mem asc, name asc
-            ( $all
-              | map(select([.name] | inside($preferred | map(.name)) | not))
-              | sort_by( (if .an then 0 else 1 end),
-                         (if .premium then 0 else 1 end),
-                         .vcpus, .mem, .name )
-            ) as $others
-            |
+            def cap($n): 
+              if .capabilities == null then empty
+              else (.capabilities | map(select(.name == $n)) | if length > 0 then .[0].value else empty end)
+              end;
+            def has_location_restriction:
+              (.restrictions // []) | map(select(.type == "Location")) | length > 0;
+            [.[] | 
+             select(.resourceType=="virtualMachines" and .name != null and (has_location_restriction | not)) | 
+             {
+               name: .name,
+               vcpus: (cap("vCPUs") | tonumber? // 0),
+               mem: (cap("MemoryGB") | tonumber? // 0),
+               premium: ((cap("PremiumIO") | ascii_downcase) == "true"),
+               an: ((cap("AcceleratedNetworkingEnabled") | ascii_downcase) == "true")
+             } | 
+             select(.vcpus >= 4 and .mem >= 8)
+            ] as $all |
+            ($pref | map(. as $p | ($all | map(select(.name==$p.name)))[0] // empty)) as $preferred |
+            ($all | map(select([.name] | inside($preferred | map(.name)) | not)) | 
+             sort_by((if .an then 0 else 1 end), (if .premium then 0 else 1 end), .vcpus, .mem, .name)) as $others |
             ($preferred + $others)
-          ' > _candidates.json
+          ' _skus.json > _candidates.json
+          
+          # Clean up
+          rm -f _skus.json
 
           if [[ ! -s _candidates.json ]]; then
             echo "No matching VM sizes found in $REGION" >&2

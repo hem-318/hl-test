@@ -116,3 +116,47 @@ Potential improvements for consideration:
 3. Cost-based ranking using pricing API
 4. Historical success rate tracking per size/region
 5. Automatic quota increase requests
+
+## Troubleshooting Update (October 2025)
+
+### Issue 1: jq Syntax Error
+Fixed a jq syntax error that was causing the workflow to fail with:
+```
+jq: error: syntax error, unexpected end of file (Unix shell quoting issues?)
+```
+
+**Resolution:**
+- Consolidated the jq command into a single line format
+- Removed multi-line string concatenation that was causing parsing issues
+- Simplified the function definition syntax
+
+### Issue 2: String Indexing Error
+Fixed another error where jq failed with:
+```
+jq: error (at <stdin>:176926): Cannot index string with string "name"
+```
+
+**Resolution:**
+- Added robust null checking for capabilities field
+- Implemented safer capability extraction with proper error handling
+- Used temporary file storage to avoid pipe buffer issues
+- Added validation to ensure only valid VM objects are processed
+
+### Zone Restrictions
+The workflow now properly handles VMs with zone restrictions:
+- Filters out VMs with location-level restrictions (NotAvailableForSubscription)
+- Allows VMs with zone-specific restrictions (they can still be created without specifying a zone)
+- This ensures maximum VM availability across regions
+
+## Testing Locally
+
+Use the included test script to verify VM selection for any region:
+```bash
+./test-vm-selection.sh <region>
+# Example: ./test-vm-selection.sh eastus
+```
+
+The script will show:
+- Top 10 VM candidates ranked by preference
+- Selected VM with its capabilities
+- Which preferred VMs are available in the region
