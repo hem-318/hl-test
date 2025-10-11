@@ -27,6 +27,20 @@ ERROR: expected string or bytes-like object, got 'NoneType'
 - Added validation to skip empty size values
 - Improved error handling in the VM creation loop
 
+### 3. Null VM Size Values
+**Problem**: VM creation was failing with null values:
+```
+Trying sizes in australiacentral: null
+Attempt 1: size=null
+ERROR: The value null provided for the VM size is not valid
+```
+
+**Solution**:
+- Updated restriction filtering to allow "NotAvailableForSubscription" VMs (they can still be deployed)
+- Added null checks in jq queries using `// empty` operator
+- Added explicit null value validation before passing to az vm create
+- Enhanced the test script to match the workflow logic
+
 ## Implementation Details
 
 ### Region Filtering

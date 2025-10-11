@@ -124,10 +124,10 @@ jobs:
               if .capabilities == null then empty
               else (.capabilities | map(select(.name == $n)) | if length > 0 then .[0].value else empty end)
               end;
-            def has_location_restriction:
-              (.restrictions // []) | map(select(.type == "Location")) | length > 0;
+            def has_blocking_restriction:
+              (.restrictions // []) | map(select(.type == "Location" and .reasonCode != "NotAvailableForSubscription")) | length > 0;
             [.[] | 
-             select(.resourceType=="virtualMachines" and .name != null and (has_location_restriction | not)) | 
+             select(.resourceType=="virtualMachines" and .name != null and (has_blocking_restriction | not)) | 
              {
                name: .name,
                vcpus: (cap("vCPUs") | tonumber? // 0),
@@ -153,8 +153,14 @@ jobs:
             exit 0
           fi
 
-          BEST_SIZE=$(jq -r '.[0].name' _candidates.json)
-          AN=$(jq -r '.[0].an' _candidates.json)
+          BEST_SIZE=$(jq -r '.[0].name // empty' _candidates.json)
+          AN=$(jq -r '.[0].an // false' _candidates.json)
+          
+          # Ensure we never output null
+          if [[ "$BEST_SIZE" == "null" ]] || [[ -z "$BEST_SIZE" ]]; then
+            BEST_SIZE=""
+            AN="false"
+          fi
 
           echo "best_size=$BEST_SIZE" >> "$GITHUB_OUTPUT"
           echo "an_supported=$AN" >> "$GITHUB_OUTPUT"
@@ -274,9 +280,9 @@ jobs:
           attempt=0
           created=false
           for size in "${candidates[@]}"; do
-            # Skip empty sizes
-            if [[ -z "$size" ]]; then
-              echo "Warning: Empty size value encountered, skipping..."
+            # Skip empty or null sizes
+            if [[ -z "$size" ]] || [[ "$size" == "null" ]]; then
+              echo "Warning: Empty or null size value encountered, skipping..."
               continue
             fi
             

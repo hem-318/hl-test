@@ -44,7 +44,7 @@ jq -r --argjson pref '[
     ($caps | map(select(.name == $name)) | if length > 0 then .[0].value else null end);
     
   [.[] | 
-   select(.restrictions | length == 0) |
+   select((.restrictions // []) | map(select(.type == "Location" and .reasonCode != "NotAvailableForSubscription")) | length == 0) |
    . as $vm |
    {
      name: .name,
