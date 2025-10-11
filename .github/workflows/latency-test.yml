@@ -46,13 +46,22 @@ jobs:
       - name: Get Azure Regions
         id: get-regions
         run: |
+          # List of regions that support VirtualNetworks (from the error message)
+          VNET_REGIONS='westus,eastus,northeurope,westeurope,eastasia,southeastasia,northcentralus,southcentralus,centralus,eastus2,japaneast,japanwest,brazilsouth,australiaeast,australiasoutheast,centralindia,southindia,westindia,canadacentral,canadaeast,westcentralus,westus2,ukwest,uksouth,koreacentral,koreasouth,francecentral,australiacentral,southafricanorth,uaenorth,switzerlandnorth,germanywestcentral,norwayeast,westus3,jioindiawest,swedencentral,qatarcentral,polandcentral,italynorth,israelcentral,mexicocentral,spaincentral,newzealandnorth,indonesiacentral,chilecentral,malaysiawest,austriaeast'
+          
           if [ -n "${{ github.event.inputs.test_regions }}" ]; then
-            # Use manually specified regions
+            # Use manually specified regions, but filter to only those that support VNets
             REGIONS='${{ github.event.inputs.test_regions }}'
-            REGIONS_JSON=$(echo $REGIONS | jq -R -s -c 'split(",") | map(gsub("\\s+"; ""))')
+            REGIONS_JSON=$(echo $REGIONS | jq -R -s -c --arg vnet_regions "$VNET_REGIONS" '
+              split(",") | map(gsub("\\s+"; "")) | 
+              map(select(. as $r | $vnet_regions | split(",") | index($r)))
+            ')
           else
-            # Get all available regions that support VMs
-            REGIONS_JSON=$(az account list-locations --query "[?metadata.regionType=='Physical' && metadata.physicalLocation!=null].name" -o json | jq -c 'sort')
+            # Get all available regions that support both VMs and VirtualNetworks
+            ALL_REGIONS=$(az account list-locations --query "[?metadata.regionType=='Physical' && metadata.physicalLocation!=null].name" -o json)
+            REGIONS_JSON=$(echo "$ALL_REGIONS" | jq -c --arg vnet_regions "$VNET_REGIONS" '
+              map(select(. as $r | $vnet_regions | split(",") | index($r))) | sort
+            ')
           fi
           
           # Determine if sequential mode is enabled
@@ -65,6 +74,7 @@ jobs:
           echo "sequential=$SEQUENTIAL" >> $GITHUB_OUTPUT
           echo "Testing regions: $REGIONS_JSON"
           echo "Sequential mode: $SEQUENTIAL"
+          echo "Note: Filtered to regions that support VirtualNetworks"
 
   latency-test:
     needs: [setup]
@@ -148,9 +158,14 @@ jobs:
 
           echo "best_size=$BEST_SIZE" >> "$GITHUB_OUTPUT"
           echo "an_supported=$AN" >> "$GITHUB_OUTPUT"
+          
+          echo "Debug: Best size found: $BEST_SIZE"
+          echo "Debug: Candidates count: $(jq 'length' _candidates.json)"
 
           # Also export a short candidate list (top 6) for fallback attempts
-          jq -r '.[0:6] | map(.name) | @tsv' _candidates.json > _candidates.tsv
+          jq -r '.[0:6] | map(.name) | join("\t")' _candidates.json > _candidates.tsv
+          echo "Debug: Fallback candidates:"
+          cat _candidates.tsv
       
       - name: Create networking resources
         if: steps.pick-size.outputs.best_size != ''
@@ -245,9 +260,13 @@ jobs:
           candidates=()
           candidates+=("$DEFAULT_SIZE")
           if [[ -f _candidates.tsv ]]; then
-            while IFS=$'\t' read -r name; do
-              [[ "$name" != "$DEFAULT_SIZE" ]] && candidates+=("$name")
-            done < _candidates.tsv
+            # Read all candidates from the TSV file
+            IFS=$'\t' read -r -a additional_candidates < _candidates.tsv || true
+            for name in "${additional_candidates[@]}"; do
+              if [[ -n "$name" && "$name" != "$DEFAULT_SIZE" ]]; then
+                candidates+=("$name")
+              fi
+            done
           fi
 
           echo "Trying sizes in ${REGION}: ${candidates[*]}"
@@ -255,6 +274,12 @@ jobs:
           attempt=0
           created=false
           for size in "${candidates[@]}"; do
+            # Skip empty sizes
+            if [[ -z "$size" ]]; then
+              echo "Warning: Empty size value encountered, skipping..."
+              continue
+            fi
+            
             attempt=$((attempt+1))
             echo "Attempt ${attempt}: size=${size}"
             set +e
