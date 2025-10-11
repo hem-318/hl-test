@@ -115,36 +115,81 @@ jobs:
           # Save to temp file to avoid pipe issues
           echo "$SKUS_JSON" > _skus.json
           
+          # Validate JSON structure
+          if ! jq -e '.' _skus.json >/dev/null 2>&1; then
+            echo "Error: Invalid JSON in SKU data"
+            echo "best_size=" >> "$GITHUB_OUTPUT"
+            echo "an_supported=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          
           # Build a table of candidate SKUs with capabilities we care about
+          # Use a simpler approach to avoid jq errors with large files
+          set +e  # Temporarily disable error exit for jq
+          
+          # First filter to just VMs to reduce data size
+          jq -r '[.[] | select(.resourceType=="virtualMachines")]' _skus.json > _vms_only.json 2>jq_error.log
+          
+          if [[ $? -ne 0 ]]; then
+            echo "Error filtering VM SKUs"
+            cat jq_error.log || true
+            echo "best_size=" >> "$GITHUB_OUTPUT"
+            echo "an_supported=false" >> "$GITHUB_OUTPUT"
+            rm -f _skus.json _vms_only.json jq_error.log
+            exit 0
+          fi
+          
+          # Now process the filtered data
           jq -r --argjson pref '[
             "Standard_F4s_v2","Standard_D4ds_v5","Standard_D4s_v5",
             "Standard_D4s_v3","Standard_F4s","Standard_D4as_v5"
           ]' '
-            def cap($n): 
-              if .capabilities == null then empty
-              else (.capabilities | map(select(.name == $n)) | if length > 0 then .[0].value else empty end)
+            def getcap($item; $capname):
+              if $item.capabilities == null then null
+              elif ($item.capabilities | type) != "array" then null
+              else 
+                ($item.capabilities[] | select(.name == $capname) | .value) // null
               end;
-            def has_blocking_restriction:
-              (.restrictions // []) | map(select(.type == "Location" and .reasonCode != "NotAvailableForSubscription")) | length > 0;
-            [.[] | 
-             select(.resourceType=="virtualMachines" and .name != null and (has_blocking_restriction | not)) | 
-             {
-               name: .name,
-               vcpus: (cap("vCPUs") | tonumber? // 0),
-               mem: (cap("MemoryGB") | tonumber? // 0),
-               premium: ((cap("PremiumIO") | ascii_downcase) == "true"),
-               an: ((cap("AcceleratedNetworkingEnabled") | ascii_downcase) == "true")
-             } | 
-             select(.vcpus >= 4 and .mem >= 8)
-            ] as $all |
-            ($pref | map(. as $p | ($all | map(select(.name==$p.name)))[0] // empty)) as $preferred |
-            ($all | map(select([.name] | inside($preferred | map(.name)) | not)) | 
-             sort_by((if .an then 0 else 1 end), (if .premium then 0 else 1 end), .vcpus, .mem, .name)) as $others |
-            ($preferred + $others)
-          ' _skus.json > _candidates.json
+            def has_blocking_restriction($item):
+              if $item.restrictions == null then false
+              elif ($item.restrictions | type) != "array" then false
+              else 
+                ($item.restrictions | map(select(.type == "Location" and .reasonCode != "NotAvailableForSubscription")) | length) > 0
+              end;
+            [
+              .[] |
+              select(.name != null and (has_blocking_restriction(.) | not)) |
+              {
+                name: .name,
+                vcpus: (getcap(.; "vCPUs") | tonumber? // 0),
+                mem: (getcap(.; "MemoryGB") | tonumber? // 0),
+                premium: (getcap(.; "PremiumIO") == "True"),
+                an: (getcap(.; "AcceleratedNetworkingEnabled") == "True")
+              } |
+              select(.vcpus >= 4 and .mem >= 8)
+            ] |
+            map(select(.name as $n | $pref | index($n))) as $preferred |
+            map(select(.name as $n | $pref | index($n) | not)) as $others |
+            ($preferred | sort_by(.name as $n | $pref | index($n))) + 
+            ($others | sort_by((if .an then 0 else 1 end), (if .premium then 0 else 1 end), .vcpus, .mem, .name))
+          ' _vms_only.json > _candidates.json 2>>jq_error.log
+          jq_exit_code=$?
+          set -e  # Re-enable error exit
+          
+          if [[ $jq_exit_code -ne 0 ]]; then
+            echo "Error processing SKU data with jq (exit code: $jq_exit_code)"
+            if [[ -f jq_error.log ]]; then
+              echo "jq error output:"
+              head -20 jq_error.log
+            fi
+            echo "best_size=" >> "$GITHUB_OUTPUT"
+            echo "an_supported=false" >> "$GITHUB_OUTPUT"
+            rm -f _skus.json jq_error.log
+            exit 0
+          fi
           
           # Clean up
-          rm -f _skus.json
+          rm -f _skus.json _vms_only.json jq_error.log
 
           if [[ ! -s _candidates.json ]]; then
             echo "No matching VM sizes found in $REGION" >&2
