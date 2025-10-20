@@ -1,7 +1,7 @@
 Enable succeeded: 
 [stdout]
-No output file found
+This is a sample script
+Optional parameters: /var/lib/waagent/run-command/download/1/script.sh
 
 [stderr]
-cat: /home/azureuser/output.log: No such file or directory
 VM size used: Standard_F4s_v2
